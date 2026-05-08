@@ -1,0 +1,556 @@
+import { useState, useEffect, useRef } from "react";
+
+// ── Data ─────────────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  // Build model
+  buildCost: 1500000,
+  buildSalePrice: 1285000,
+  buildTimeline: 18,
+  buildsPerYear: 15,
+  govGrantPerBuild: 157832, // 1.1M / 7 homes 2025
+  volunteerHoursPerBuild: 6416, // 44914 / 7
+  // Acquire model
+  acquireCost: 375000,
+  rehabCost: 75000,
+  acquireSalePrice: 320000,
+  acquireTimeline: 8,
+  acquiresPerYear: 15,
+  govGrantPerAcquire: 80000,
+  volunteerHoursPerAcquire: 2800,
+  // BuyBack cycling
+  buybackCycles: 3,
+  buybackRefreshCost: 45000,
+  yearsPerCycle: 8,
+  // Shared
+  annualGovGrant: 1104827,
+  targetHomes: 45,
+  targetYears: 3,
+};
+
+const fmt = (n, type = "dollar") => {
+  if (type === "dollar") return n < 0
+    ? `-$${Math.abs(n).toLocaleString()}`
+    : `$${n.toLocaleString()}`;
+  if (type === "pct") return `${(n * 100).toFixed(1)}%`;
+  if (type === "num") return n.toLocaleString();
+  if (type === "mo") return `${n} mo.`;
+  return n;
+};
+
+const fmtK = (n) => {
+  if (Math.abs(n) >= 1000000) return `$${(n/1000000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1000) return `$${(n/1000).toFixed(0)}K`;
+  return `$${n}`;
+};
+
+// ── Calculations ──────────────────────────────────────────────────────────────
+function calc(p) {
+  const buildNetPerHome = p.buildSalePrice - p.buildCost + p.govGrantPerBuild;
+  const buildTotalCapital = p.buildCost * p.targetHomes;
+  const buildTotalDeficit = buildNetPerHome * p.targetHomes;
+  const buildAnnualDeficit = buildTotalDeficit / p.targetYears;
+
+  const acqTotalCostPerHome = p.acquireCost + p.rehabCost;
+  const acqNetPerHome = p.acquireSalePrice - acqTotalCostPerHome + p.govGrantPerAcquire;
+  const acqTotalCapital = acqTotalCostPerHome * p.targetHomes;
+  const acqTotalDeficit = acqNetPerHome * p.targetHomes;
+  const acqAnnualDeficit = acqTotalDeficit / p.targetYears;
+
+  // BuyBack value: one home serves multiple families
+  const buybackTotalFamilies = p.buybackCycles;
+  const buybackTotalCost = p.acquireCost + p.rehabCost + (p.buybackCycles - 1) * p.buybackRefreshCost;
+  const buybackCostPerFamily = buybackTotalCost / p.buybackCycles;
+  const buybackVsBuildSaving = p.buildCost - buybackCostPerFamily;
+
+  // Capital efficiency: homes per $1M
+  const buildHomesPerMillion = 1000000 / p.buildCost;
+  const acqHomesPerMillion = 1000000 / acqTotalCostPerHome;
+
+  // 3-year program totals
+  const buildFamiliesServed = p.targetHomes;
+  const acqFamiliesServed = p.targetHomes;
+
+  // Volunteer hours
+  const buildTotalHours = p.volunteerHoursPerBuild * p.targetHomes;
+  const acqTotalHours = p.volunteerHoursPerAcquire * p.targetHomes;
+
+  return {
+    buildNetPerHome, buildTotalCapital, buildTotalDeficit, buildAnnualDeficit,
+    acqTotalCostPerHome, acqNetPerHome, acqTotalCapital, acqTotalDeficit, acqAnnualDeficit,
+    buybackTotalFamilies, buybackTotalCost, buybackCostPerFamily, buybackVsBuildSaving,
+    buildHomesPerMillion, acqHomesPerMillion,
+    buildFamiliesServed, acqFamiliesServed,
+    buildTotalHours, acqTotalHours,
+    capitalSaving: buildTotalCapital - acqTotalCapital,
+    deficitSaving: buildTotalDeficit - acqTotalDeficit,
+  };
+}
+
+// ── Components ────────────────────────────────────────────────────────────────
+function Pill({ label, value, color = "#00A6A0", sub }) {
+  return (
+    <div style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 12, padding: "16px 20px", minWidth: 140 }}>
+      <div style={{ fontSize: 11, letterSpacing: 3, color: "rgba(255,255,255,0.4)", fontFamily: "var(--mono)", marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 26, fontWeight: 800, color, fontFamily: "var(--display)", letterSpacing: -1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function CompareRow({ label, build, acquire, buildColor, acqColor, winner, note }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 1, marginBottom: 1 }}>
+      <div style={{ background: "rgba(255,255,255,0.03)", padding: "12px 16px", fontSize: 13, color: "rgba(255,255,255,0.7)" }}>
+        {label}
+        {note && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>{note}</div>}
+      </div>
+      <div style={{ background: winner === "build" ? "rgba(255,107,53,0.12)" : "rgba(255,255,255,0.02)", padding: "12px 16px", fontSize: 14, fontWeight: 600, color: buildColor || "rgba(255,107,53,0.9)", textAlign: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+        {winner === "build" && <span style={{ fontSize: 10, color: "#FF6B35" }}>★</span>}
+        {build}
+      </div>
+      <div style={{ background: winner === "acquire" ? "rgba(0,166,160,0.12)" : "rgba(255,255,255,0.02)", padding: "12px 16px", fontSize: 14, fontWeight: 600, color: acqColor || "rgba(0,166,160,0.9)", textAlign: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+        {winner === "acquire" && <span style={{ fontSize: 10, color: "#00A6A0" }}>★</span>}
+        {acquire}
+      </div>
+    </div>
+  );
+}
+
+function Slider({ label, value, min, max, step, onChange, format = "dollar", note }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", fontFamily: "var(--mono)" }}>{label}</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: "#00A6A0", fontFamily: "var(--mono)" }}>{format === "dollar" ? fmtK(value) : format === "mo" ? `${value} mo.` : value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))}
+        style={{ width: "100%", accentColor: "#00A6A0", cursor: "pointer" }} />
+      {note && <div style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", marginTop: 3 }}>{note}</div>}
+    </div>
+  );
+}
+
+function BarChart({ data, height = 180 }) {
+  const max = Math.max(...data.map(d => Math.abs(d.value)));
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height, paddingBottom: 24, position: "relative" }}>
+      {data.map((d, i) => {
+        const h = (Math.abs(d.value) / max) * (height - 40);
+        const isNeg = d.value < 0;
+        return (
+          <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+            <div style={{ fontSize: 10, color: isNeg ? "#FF6B6B" : "#00A6A0", fontWeight: 700, fontFamily: "var(--mono)", whiteSpace: "nowrap" }}>
+              {fmtK(d.value)}
+            </div>
+            <div style={{ width: "100%", height: h, background: isNeg ? "rgba(255,107,107,0.6)" : `rgba(${d.color || "0,166,160"},0.7)`, borderRadius: "4px 4px 0 0", border: `1px solid ${isNeg ? "rgba(255,107,107,0.4)" : "rgba(0,166,160,0.4)"}`, transition: "height 0.4s cubic-bezier(0.4,0,0.2,1)" }} />
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textAlign: "center", lineHeight: 1.3, position: "absolute", bottom: 0 }}>{d.label}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [p, setP] = useState(DEFAULTS);
+  const [tab, setTab] = useState("compare");
+  const [visible, setVisible] = useState(false);
+  const r = calc(p);
+
+  useEffect(() => { setTimeout(() => setVisible(true), 100); }, []);
+
+  const set = (key) => (val) => setP(prev => ({ ...prev, [key]: val }));
+
+  const TEAL = "#00A6A0";
+  const ORANGE = "#FF6B35";
+  const RED = "#FF6B6B";
+
+  return (
+    <div style={{ "--display": "'Playfair Display', Georgia, serif", "--mono": "'DM Mono', monospace", "--body": "'DM Sans', sans-serif", fontFamily: "var(--body)", background: "#0C1220", minHeight: "100vh", color: "#E8EAF0" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #00A6A0; border-radius: 2px; }
+        input[type=range] { -webkit-appearance: none; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #00A6A0; cursor: pointer; }
+        .tab-btn { transition: all 0.2s; cursor: pointer; }
+        .tab-btn:hover { color: #fff !important; }
+        .fade-in { opacity: 0; transform: translateY(16px); animation: fu 0.6s forwards; }
+        @keyframes fu { to { opacity: 1; transform: translateY(0); } }
+        .card { transition: border-color 0.2s; }
+        .card:hover { border-color: rgba(0,166,160,0.3) !important; }
+      `}</style>
+
+      {/* Header */}
+      <div style={{ borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "0 32px" }}>
+        <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", height: 56 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 28, height: 28, background: TEAL, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>🏠</div>
+            <div>
+              <span style={{ fontFamily: "var(--display)", fontSize: 14, fontWeight: 700, color: "#fff" }}>Habitat Edmonton</span>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "rgba(255,255,255,0.3)", marginLeft: 8 }}>STRATEGIC UNIT ECONOMICS MODEL</span>
+            </div>
+          </div>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", fontFamily: "var(--mono)", letterSpacing: 1 }}>
+            BASED ON 2025 AUDITED FINANCIALS · AI-ASSISTED ANALYSIS
+          </div>
+        </div>
+      </div>
+
+      {/* Hero */}
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "32px 32px 0" }}>
+        <div className={visible ? "fade-in" : ""}>
+          <div style={{ fontSize: 10, letterSpacing: 4, color: TEAL, fontFamily: "var(--mono)", marginBottom: 10 }}>THE STRATEGIC QUESTION</div>
+          <h1 style={{ fontFamily: "var(--display)", fontSize: 42, lineHeight: 1.1, color: "#fff", marginBottom: 12 }}>
+            Build New <span style={{ color: "rgba(255,255,255,0.2)", fontStyle: "italic" }}>or</span><br />
+            Acquire & Refresh?
+          </h1>
+          <p style={{ fontSize: 14, color: "rgba(255,255,255,0.5)", maxWidth: 580, lineHeight: 1.7, marginBottom: 28 }}>
+            Habitat Edmonton's 45-home, 3-year goal requires a clear-eyed look at the unit economics of each delivery model. This tool models both paths using 2025 actual financial data — and lets you stress-test the assumptions.
+          </p>
+
+          {/* KPI strip */}
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 32 }}>
+            <Pill label="2025 DEFICIT" value={fmtK(-3566479)} color={RED} sub="Actual audited result" />
+            <Pill label="BUILD COST / HOME" value={fmtK(p.buildCost)} color={ORANGE} sub="2025 implied" />
+            <Pill label="ACQUIRE + REHAB" value={fmtK(p.acquireCost + p.rehabCost)} color={TEAL} sub="Estimated all-in" />
+            <Pill label="CAPITAL SAVED (45 HM)" value={fmtK(r.capitalSaving)} color={TEAL} sub="Acquire vs. build" />
+            <Pill label="HOMES / $1M — BUILD" value={r.buildHomesPerMillion.toFixed(2)} color={ORANGE} sub="Capital efficiency" />
+            <Pill label="HOMES / $1M — ACQUIRE" value={r.acqHomesPerMillion.toFixed(2)} color={TEAL} sub="Capital efficiency" />
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div style={{ display: "flex", borderBottom: "1px solid rgba(255,255,255,0.06)", marginBottom: 28 }}>
+          {[["compare", "Side-by-Side Comparison"], ["threeyear", "3-Year Program Model"], ["buyback", "BuyBack Value Analysis"], ["assumptions", "Adjust Assumptions"]].map(([id, label]) => (
+            <button key={id} className="tab-btn" onClick={() => setTab(id)}
+              style={{ padding: "12px 20px", background: "none", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 500, letterSpacing: 0.5,
+                color: tab === id ? "#fff" : "rgba(255,255,255,0.35)",
+                borderBottom: tab === id ? `2px solid ${TEAL}` : "2px solid transparent",
+                fontFamily: "var(--mono)" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── TAB: COMPARE ── */}
+        {tab === "compare" && (
+          <div className="fade-in">
+            {/* Column headers */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 1, marginBottom: 1 }}>
+              <div style={{ padding: "10px 16px", fontSize: 10, letterSpacing: 2, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)" }}>METRIC</div>
+              <div style={{ padding: "10px 16px", fontSize: 10, letterSpacing: 2, color: ORANGE, fontFamily: "var(--mono)", textAlign: "center", background: "rgba(255,107,53,0.06)", borderRadius: "8px 8px 0 0" }}>🏗 NEW BUILD</div>
+              <div style={{ padding: "10px 16px", fontSize: 10, letterSpacing: 2, color: TEAL, fontFamily: "var(--mono)", textAlign: "center", background: "rgba(0,166,160,0.06)", borderRadius: "8px 8px 0 0" }}>🏠 ACQUIRE + REFRESH</div>
+            </div>
+
+            <CompareRow label="Cost per home" note="All-in before grant"
+              build={fmtK(p.buildCost)} acquire={fmtK(p.acquireCost + p.rehabCost)}
+              winner="acquire" />
+            <CompareRow label="Avg. sale price to family"
+              build={fmtK(p.buildSalePrice)} acquire={fmtK(p.acquireSalePrice)}
+              winner="acquire" />
+            <CompareRow label="Government grant per home"
+              build={fmtK(p.govGrantPerBuild)} acquire={fmtK(p.govGrantPerAcquire)}
+              winner="build" />
+            <CompareRow label="Net surplus / (deficit) per home" note="Sale + grant − cost"
+              build={fmt(r.buildNetPerHome)} acquire={fmt(r.acqNetPerHome)}
+              buildColor={r.buildNetPerHome < 0 ? RED : TEAL}
+              acqColor={r.acqNetPerHome < 0 ? RED : TEAL}
+              winner={r.acqNetPerHome > r.buildNetPerHome ? "acquire" : "build"} />
+            <CompareRow label="Build / delivery timeline"
+              build={`${p.buildTimeline} months`} acquire={`${p.acquireTimeline} months`}
+              winner="acquire" />
+            <CompareRow label="Volunteer hours per home" note="Est. skilled + unskilled"
+              build={p.volunteerHoursPerBuild.toLocaleString()} acquire={p.volunteerHoursPerAcquire.toLocaleString()}
+              winner="acquire" />
+            <CompareRow label="Homes per $1M deployed"
+              build={r.buildHomesPerMillion.toFixed(2)} acquire={r.acqHomesPerMillion.toFixed(2)}
+              winner="acquire" />
+            <CompareRow label="Social media content potential" note="Visual transformation cycle"
+              build="12–18 month build site" acquire="Weekend before/after reel"
+              winner="acquire" />
+            <CompareRow label="Volunteer skill requirement"
+              build="Specialized trades heavy" acquire="Accessible — painting, flooring, fixtures"
+              winner="acquire" />
+            <CompareRow label="Community location"
+              build="Often greenfield / new suburb" acquire="Established neighbourhood, existing schools & transit"
+              winner="acquire" />
+
+            {/* Summary callout */}
+            <div style={{ marginTop: 20, background: "rgba(0,166,160,0.06)", border: "1px solid rgba(0,166,160,0.2)", borderRadius: 12, padding: 24 }}>
+              <div style={{ fontSize: 10, letterSpacing: 3, color: TEAL, fontFamily: "var(--mono)", marginBottom: 10 }}>SUMMARY FINDING</div>
+              <p style={{ fontSize: 14, color: "rgba(255,255,255,0.75)", lineHeight: 1.8 }}>
+                The acquire and refresh model delivers the same mission outcome — a family in a stable, affordable home — at approximately <strong style={{ color: TEAL }}>{Math.round((1 - (p.acquireCost + p.rehabCost) / p.buildCost) * 100)}% lower capital cost per home</strong> and <strong style={{ color: TEAL }}>{Math.round((1 - p.acquireTimeline / p.buildTimeline) * 100)}% faster delivery timeline</strong>. When combined with the BuyBack program's cycling model, the long-term cost per family served drops further still. The primary constraint is not financial — it is strategic will and acquisition pipeline development.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ── TAB: 3-YEAR MODEL ── */}
+        {tab === "threeyear" && (
+          <div className="fade-in">
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+              {/* Build scenario */}
+              <div className="card" style={{ background: "rgba(255,107,53,0.04)", border: "1px solid rgba(255,107,53,0.15)", borderRadius: 12, padding: 24 }}>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: ORANGE, fontFamily: "var(--mono)", marginBottom: 12 }}>🏗 SCENARIO A — ALL NEW BUILDS</div>
+                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 20 }}>{p.targetHomes} homes × {p.targetYears} years</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {[
+                    ["Total capital required", fmtK(r.buildTotalCapital), "rgba(255,255,255,0.7)"],
+                    ["Total government grants", fmtK(p.govGrantPerBuild * p.targetHomes), "rgba(255,255,255,0.7)"],
+                    ["Total families served", p.targetHomes, "rgba(255,255,255,0.7)"],
+                    ["Avg. delivery time", `${p.buildTimeline} months`, "rgba(255,255,255,0.7)"],
+                    ["Total volunteer hours", r.buildTotalHours.toLocaleString(), "rgba(255,255,255,0.7)"],
+                    ["3-year program surplus/(deficit)", fmtK(r.buildTotalDeficit), r.buildTotalDeficit < 0 ? RED : TEAL],
+                    ["Annual surplus/(deficit)", fmtK(r.buildAnnualDeficit), r.buildAnnualDeficit < 0 ? RED : TEAL],
+                  ].map(([k, v, c]) => (
+                    <div key={k} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: 8 }}>
+                      <span style={{ fontSize: 12, color: "rgba(255,255,255,0.45)" }}>{k}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: c, fontFamily: "var(--mono)" }}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Acquire scenario */}
+              <div className="card" style={{ background: "rgba(0,166,160,0.04)", border: "1px solid rgba(0,166,160,0.2)", borderRadius: 12, padding: 24 }}>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: TEAL, fontFamily: "var(--mono)", marginBottom: 12 }}>🏠 SCENARIO B — ACQUIRE + REFRESH</div>
+                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 20 }}>{p.targetHomes} homes × {p.targetYears} years</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {[
+                    ["Total capital required", fmtK(r.acqTotalCapital), "rgba(255,255,255,0.7)"],
+                    ["Total government grants", fmtK(p.govGrantPerAcquire * p.targetHomes), "rgba(255,255,255,0.7)"],
+                    ["Total families served", p.targetHomes, "rgba(255,255,255,0.7)"],
+                    ["Avg. delivery time", `${p.acquireTimeline} months`, "rgba(255,255,255,0.7)"],
+                    ["Total volunteer hours", r.acqTotalHours.toLocaleString(), "rgba(255,255,255,0.7)"],
+                    ["3-year program surplus/(deficit)", fmtK(r.acqTotalDeficit), r.acqTotalDeficit < 0 ? RED : TEAL],
+                    ["Annual surplus/(deficit)", fmtK(r.acqAnnualDeficit), r.acqAnnualDeficit < 0 ? RED : TEAL],
+                  ].map(([k, v, c]) => (
+                    <div key={k} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: 8 }}>
+                      <span style={{ fontSize: 12, color: "rgba(255,255,255,0.45)" }}>{k}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: c, fontFamily: "var(--mono)" }}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Delta bar */}
+            <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 24, marginBottom: 20 }}>
+              <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 16 }}>3-YEAR PROGRAM COMPARISON — CAPITAL DEPLOYMENT</div>
+              <BarChart height={200} data={[
+                { label: "Build\nCapital", value: r.buildTotalCapital, color: "255,107,53" },
+                { label: "Acquire\nCapital", value: r.acqTotalCapital, color: "0,166,160" },
+                { label: "Capital\nSaved", value: r.capitalSaving, color: "0,166,160" },
+                { label: "Build\nDeficit", value: r.buildTotalDeficit },
+                { label: "Acquire\nDeficit", value: r.acqTotalDeficit },
+                { label: "Deficit\nImproved", value: r.deficitSaving },
+              ]} />
+            </div>
+
+            {/* Hybrid scenario */}
+            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 12, padding: 24 }}>
+              <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 12 }}>💡 SCENARIO C — RECOMMENDED HYBRID (70% ACQUIRE / 30% BUILD)</div>
+              <p style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", lineHeight: 1.7, marginBottom: 16 }}>
+                A blended approach preserves Habitat's build identity and volunteer culture while materially improving financial sustainability. 30% new builds maintains community build events, corporate partnerships, and brand narrative. 70% acquire and refresh accelerates family impact, reduces capital requirements, and enables faster delivery.
+              </p>
+              {(() => {
+                const buildN = Math.round(p.targetHomes * 0.3);
+                const acqN = p.targetHomes - buildN;
+                const hybridCapital = buildN * p.buildCost + acqN * (p.acquireCost + p.rehabCost);
+                const hybridDeficit = buildN * r.buildNetPerHome + acqN * r.acqNetPerHome;
+                const hybridGrant = buildN * p.govGrantPerBuild + acqN * p.govGrantPerAcquire;
+                return (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                    {[
+                      ["New builds", buildN, "rgba(255,255,255,0.7)"],
+                      ["Acquisitions", acqN, TEAL],
+                      ["Total capital", fmtK(hybridCapital), "rgba(255,255,255,0.7)"],
+                      ["3-yr surplus/(deficit)", fmtK(hybridDeficit), hybridDeficit < 0 ? RED : TEAL],
+                    ].map(([k, v, c]) => (
+                      <div key={k} style={{ background: "rgba(255,255,255,0.03)", borderRadius: 8, padding: "14px 16px" }}>
+                        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 6 }}>{k}</div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: c, fontFamily: "var(--display)" }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
+        {/* ── TAB: BUYBACK ── */}
+        {tab === "buyback" && (
+          <div className="fade-in">
+            <div style={{ marginBottom: 20 }}>
+              <h2 style={{ fontFamily: "var(--display)", fontSize: 24, color: "#fff", marginBottom: 8 }}>The BuyBack Multiplier Effect</h2>
+              <p style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", lineHeight: 1.7, maxWidth: 680 }}>
+                The BuyBack program turns a single home into a perpetual community asset. Each home acquired and enrolled in BuyBack can serve multiple families over its lifespan — dramatically reducing the effective cost per family served over time.
+              </p>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+              <div style={{ background: "rgba(0,166,160,0.04)", border: "1px solid rgba(0,166,160,0.15)", borderRadius: 12, padding: 24 }}>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: TEAL, fontFamily: "var(--mono)", marginBottom: 16 }}>BUYBACK LIFECYCLE — ONE HOME</div>
+                {[...Array(p.buybackCycles)].map((_, i) => {
+                  const cost = i === 0 ? (p.acquireCost + p.rehabCost) : p.buybackRefreshCost;
+                  const cumCost = i === 0 ? cost : (p.acquireCost + p.rehabCost) + i * p.buybackRefreshCost;
+                  const costPerFam = cumCost / (i + 1);
+                  return (
+                    <div key={i} style={{ display: "flex", gap: 14, marginBottom: 16, alignItems: "flex-start" }}>
+                      <div style={{ width: 28, height: 28, background: TEAL, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>{i + 1}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, color: "#fff", fontWeight: 600, marginBottom: 2 }}>
+                          {i === 0 ? "Initial acquisition + rehab" : `BuyBack cycle ${i} — refresh`}
+                        </div>
+                        <div style={{ display: "flex", gap: 16, fontSize: 11, color: "rgba(255,255,255,0.4)", fontFamily: "var(--mono)" }}>
+                          <span>Cycle cost: {fmtK(cost)}</span>
+                          <span>Cumulative cost/family: <span style={{ color: TEAL }}>{fmtK(Math.round(costPerFam))}</span></span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <div style={{ marginTop: 16, padding: 16, background: "rgba(0,166,160,0.1)", borderRadius: 8 }}>
+                  <div style={{ fontSize: 10, letterSpacing: 2, color: TEAL, fontFamily: "var(--mono)", marginBottom: 6 }}>AFTER {p.buybackCycles} CYCLES</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>Families served</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: TEAL, fontFamily: "var(--display)" }}>{p.buybackCycles}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>Cost per family</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: TEAL, fontFamily: "var(--display)" }}>{fmtK(Math.round(r.buybackCostPerFamily))}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>vs. new build cost</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: TEAL, fontFamily: "var(--display)" }}>{fmtK(p.buildCost)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>Saving vs. build</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: TEAL, fontFamily: "var(--display)" }}>{fmtK(Math.round(r.buybackVsBuildSaving))}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 24 }}>
+                  <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 12 }}>SCALING BUYBACK — 45 HOMES ENROLLED</div>
+                  <p style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", lineHeight: 1.7, marginBottom: 16 }}>
+                    If all 45 target homes are acquired and enrolled in BuyBack, the long-term program impact compounds significantly beyond the initial 3-year window.
+                  </p>
+                  {(() => {
+                    const totalFamilies = 45 * p.buybackCycles;
+                    const totalCost = 45 * r.buybackTotalCost;
+                    const cpf = totalCost / totalFamilies;
+                    const vsBuild = 45 * p.buildCost - totalCost;
+                    return (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                        {[
+                          ["Total families served", totalFamilies, TEAL],
+                          ["Total program cost", fmtK(Math.round(totalCost)), "rgba(255,255,255,0.7)"],
+                          ["Cost per family", fmtK(Math.round(cpf)), TEAL],
+                          ["Capital saved vs. all-build", fmtK(Math.round(vsBuild)), TEAL],
+                        ].map(([k, v, c]) => (
+                          <div key={k} style={{ background: "rgba(0,166,160,0.06)", borderRadius: 8, padding: "12px 14px" }}>
+                            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 4 }}>{k}</div>
+                            <div style={{ fontSize: 20, fontWeight: 800, color: c, fontFamily: "var(--display)" }}>{v}</div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                  <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 10 }}>ACQUISITION PIPELINE — WHERE TO SOURCE HOMES</div>
+                  {[
+                    ["City of Edmonton surplus properties", "Below-market transfer for affordable housing mandate"],
+                    ["Alberta Housing provincial stock", "Aging social housing candidates for transfer"],
+                    ["Civida portfolio optimization", "ECF-connected partner — $20M already in play"],
+                    ["Open market — estate/distressed", "Older Edmonton neighbourhoods, value-add candidates"],
+                    ["Federal surplus land (CMHC)", "Public Lands for Homes plan — federal priority"],
+                  ].map(([source, note]) => (
+                    <div key={source} style={{ display: "flex", gap: 10, marginBottom: 10, alignItems: "flex-start" }}>
+                      <span style={{ color: TEAL, fontSize: 12, flexShrink: 0, marginTop: 1 }}>→</span>
+                      <div>
+                        <div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)", fontWeight: 500 }}>{source}</div>
+                        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}>{note}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── TAB: ASSUMPTIONS ── */}
+        {tab === "assumptions" && (
+          <div className="fade-in">
+            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 24, lineHeight: 1.7 }}>
+              All assumptions are editable. Changes update the comparison, 3-year model, and BuyBack analysis in real time. Blue values in the comparison tabs reflect your inputs.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24 }}>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: ORANGE, fontFamily: "var(--mono)", marginBottom: 16 }}>🏗 BUILD MODEL</div>
+                <Slider label="Build cost per home" value={p.buildCost} min={800000} max={2500000} step={25000} onChange={set("buildCost")} note="2025 implied: ~$1.52M" />
+                <Slider label="Sale price to family" value={p.buildSalePrice} min={600000} max={1800000} step={25000} onChange={set("buildSalePrice")} note="2025 implied: ~$1.28M" />
+                <Slider label="Gov. grant per build" value={p.govGrantPerBuild} min={0} max={500000} step={5000} onChange={set("govGrantPerBuild")} note="2025: $1.1M / 7 homes" />
+                <Slider label="Delivery timeline" value={p.buildTimeline} min={6} max={30} step={1} onChange={set("buildTimeline")} format="mo" note="Months from approval to occupancy" />
+                <Slider label="Volunteer hrs / home" value={p.volunteerHoursPerBuild} min={1000} max={15000} step={100} onChange={set("volunteerHoursPerBuild")} format="num" note="2025: 44,914 hrs / 7 homes" />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: TEAL, fontFamily: "var(--mono)", marginBottom: 16 }}>🏠 ACQUIRE + REFRESH</div>
+                <Slider label="Acquisition cost" value={p.acquireCost} min={200000} max={700000} step={10000} onChange={set("acquireCost")} note="Edmonton older neighbourhood estimate" />
+                <Slider label="Refresh / rehab cost" value={p.rehabCost} min={20000} max={200000} step={5000} onChange={set("rehabCost")} note="Volunteer labour + materials" />
+                <Slider label="Sale price to family" value={p.acquireSalePrice} min={200000} max={600000} step={10000} onChange={set("acquireSalePrice")} note="Affordable pricing for qualifying family" />
+                <Slider label="Gov. grant per acquire" value={p.govGrantPerAcquire} min={0} max={300000} step={5000} onChange={set("govGrantPerAcquire")} note="CMHC rehab / existing unit funding" />
+                <Slider label="Delivery timeline" value={p.acquireTimeline} min={2} max={18} step={1} onChange={set("acquireTimeline")} format="mo" note="Acquisition to occupancy" />
+                <Slider label="Volunteer hrs / home" value={p.volunteerHoursPerAcquire} min={200} max={6000} step={100} onChange={set("volunteerHoursPerAcquire")} format="num" note="Refresh weekend + light reno" />
+              </div>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 16 }}>📊 PROGRAM & BUYBACK</div>
+                <Slider label="Target homes (3-yr goal)" value={p.targetHomes} min={10} max={80} step={5} onChange={set("targetHomes")} format="num" note="CEO stated goal: 45 homes" />
+                <Slider label="Target years" value={p.targetYears} min={1} max={5} step={1} onChange={set("targetYears")} format="num" />
+                <Slider label="BuyBack cycles per home" value={p.buybackCycles} min={1} max={6} step={1} onChange={set("buybackCycles")} format="num" note="Families served per property over lifespan" />
+                <Slider label="BuyBack refresh cost" value={p.buybackRefreshCost} min={10000} max={120000} step={5000} onChange={set("buybackRefreshCost")} note="Per refresh cycle (subsequent families)" />
+              </div>
+            </div>
+
+            <div style={{ marginTop: 24, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+              <div style={{ fontSize: 10, letterSpacing: 3, color: "rgba(255,255,255,0.3)", fontFamily: "var(--mono)", marginBottom: 10 }}>DATA SOURCES</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {[
+                  ["Build cost & sale price", "Habitat Edmonton 2025 audited financials (KPMG)"],
+                  ["Government grants", "Habitat Edmonton 2025 income statement"],
+                  ["Volunteer hours", "2025 Annual Report — 44,914 hrs / 7 homes"],
+                  ["Acquisition cost", "Edmonton MLS market data estimate — older stock"],
+                  ["Rehab cost", "Industry benchmark — light residential renovation"],
+                  ["Gov. grant (acquire)", "CMHC National Housing Co-Investment Fund — rehab stream"],
+                  ["BuyBack mechanics", "Habitat Canada program documentation"],
+                  ["Pipeline sources", "ECF-Civida announcement, federal Public Lands plan"],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", gap: 8 }}>
+                    <span style={{ color: TEAL, fontSize: 11, flexShrink: 0 }}>·</span>
+                    <div>
+                      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", fontWeight: 500 }}>{k}: </span>
+                      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>{v}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div style={{ height: 48 }} />
+      </div>
+    </div>
+  );
+}
